@@ -11,7 +11,9 @@ from typing import Any, Union
 import torch
 import torch.nn as nn
 
-from NatureLM.storage_utils import GSPath, is_gcs_path
+from NatureLM.storage_handler import StorageHandler
+
+# from NatureLM.storage_utils import GSPath, is_gcs_path
 
 logger = logging.getLogger(__name__)
 
@@ -44,34 +46,26 @@ def get_state_dict(model, drop_untrained_params: bool = True) -> dict[str, Any]:
     return state_dict
 
 
-def torch_save_to_bucket(save_obj: Any, save_path: Union[str, os.PathLike, GSPath], compress: bool = True) -> None:
-    """Save an object directly to GCS bucket without intermediate disk storage.
 
-    Args:
-        save_obj: Object to save (usually model state dict or checkpoint)
-        save_path: Path to save in GCS bucket (must be gs:// path)
-        compress: Whether to use compression. Default: True
-    """
-    if not is_gcs_path(save_path):
-        raise ValueError("save_path must be a GCS path")
+def torch_save_to_bucket(save_obj: Any, save_path: Union[str, os.PathLike], compress: bool = True) -> None:
+    """Save an object to a storage backend (local or GCS)."""
+    handler = StorageHandler()  # or inject it
 
-    # Convert to GSPath if string
-    if isinstance(save_path, (str, os.PathLike)):
-        save_path = GSPath(str(save_path))
+    resolved_path = handler.resolve(save_path)
 
-    # save to a temporary local file and then upload to GCS
-    with tempfile.NamedTemporaryFile() as tmp:
-        torch.save(save_obj, tmp.name, _use_new_zipfile_serialization=compress)
-        try:
-            save_path.upload_from(tmp.name)
-        except Exception as e:
-            logger.error(f"Error saving to GCP bucket: {e}")
-            raise e
+    # If GCS: resolved_path will be a GSPath and has `.upload_from`
+    # If local: resolved_path is a Path and can use torch.save directly
+    if hasattr(resolved_path, "upload_from"):
+        with tempfile.NamedTemporaryFile() as tmp:
+            torch.save(save_obj, tmp.name, _use_new_zipfile_serialization=compress)
+            resolved_path.upload_from(tmp.name)
+    else:
+        torch.save(save_obj, resolved_path, _use_new_zipfile_serialization=compress)
 
 
 def save_model_checkpoint(
     model: nn.Module,
-    save_path: Union[str, os.PathLike, GSPath],
+    save_path: Union[str, os.PathLike],
     use_distributed: bool = False,
     drop_untrained_params: bool = False,
     **objects_to_save,
@@ -88,8 +82,9 @@ def save_model_checkpoint(
         extention (str): Extension to use for the checkpoint file. Default: "pth".
         **objects_to_save: Additional objects to save, e.g. optimizer state dict, etc.
     """
-    if not is_gcs_path(save_path) and not os.path.exists(os.path.dirname(save_path)):
-        raise FileNotFoundError(f"Directory {os.path.dirname(save_path)} does not exist.")
+   
+    handler = StorageHandler()
+    resolved_path = handler.resolve(save_path)
 
     model_no_ddp = maybe_unwrap_dist_model(model, use_distributed)
     state_dict = get_state_dict(model_no_ddp, drop_untrained_params)
@@ -98,9 +93,14 @@ def save_model_checkpoint(
         **objects_to_save,
     }
 
-    logger.info("Saving checkpoint to {}.".format(save_path))
+    logger.info(f"Saving checkpoint to {resolved_path}")
 
-    if is_gcs_path(save_path):
-        torch_save_to_bucket(save_obj, save_path)
+    if hasattr(resolved_path, "upload_from"):
+        # It's a GSPath
+        with tempfile.NamedTemporaryFile() as tmp:
+            torch.save(save_obj, tmp.name)
+            resolved_path.upload_from(tmp.name)
     else:
-        torch.save(save_obj, save_path)
+        # It's a local Path
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(save_obj, resolved_path)

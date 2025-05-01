@@ -21,9 +21,6 @@ from pydantic import BaseModel, field_validator
 from pydantic.v1.utils import deep_update
 from pydantic_settings import BaseSettings, CliSettingsSource, YamlConfigSettingsSource
 
-from NatureLM.storage_utils import GSPath, is_gcs_path
-
-
 class OptimizerConfig(BaseModel, extra="forbid", validate_assignment=True):
     max_epoch: int
     warmup_steps: int
@@ -141,10 +138,11 @@ class GenerateConfig(BaseModel, extra="forbid", validate_assignment=True):
 
 
 class ModelConfig(BaseModel, extra="forbid", validate_assignment=True):
-    llama_path: Path
-    beats_path: Path | GSPath | None = None
+    storage: Literal["local", "gcs"] = "local"
+    llama_path: str
+    beats_path: str | None = None
     beats_cfg: BeatsConfig
-    ckpt: Path | GSPath | None = None
+    ckpt: str | None = None
     freeze_beats: bool = True
     use_audio_Qformer: bool = True
     max_pooling: bool = False
@@ -154,7 +152,7 @@ class ModelConfig(BaseModel, extra="forbid", validate_assignment=True):
     num_audio_query_token: int = 1
     second_per_window: float = 0.333333
     second_stride: float = 0.333333
-    audio_llama_proj_model: Path | GSPath | None = None
+    audio_llama_proj_model: str | None = None
     freeze_audio_llama_proj: bool = False
     device: str = "cuda"
     lora: bool = True
@@ -166,16 +164,16 @@ class ModelConfig(BaseModel, extra="forbid", validate_assignment=True):
     max_txt_len: int = 128
     end_sym: str = "</s>"
 
-    @field_validator("beats_path", "audio_llama_proj_model", "ckpt", mode="before")
-    @classmethod
-    def detect_gcs_path(cls, value: Any) -> Any:
-        """Pydantic's automatic type conversion won't be able to deal with gs:// paths
-        so we need to manually detect and convert them to GSPath objects _before_
-        validation"""
-        if value and is_gcs_path(value):
-            return GSPath(str(value))
-        else:
-            return value
+    # @field_validator("beats_path", "audio_llama_proj_model", "ckpt", mode="before")
+    # @classmethod
+    # def detect_gcs_path(cls, value: Any) -> Any:
+    #     """Pydantic's automatic type conversion won't be able to deal with gs:// paths
+    #     so we need to manually detect and convert them to GSPath objects _before_
+    #     validation"""
+    #     if value and is_gcs_path(value):
+    #         return GSPath(str(value))
+    #     else:
+    #         return value
 
     @field_validator("ckpt", "audio_llama_proj_model", mode="before")
     @classmethod
@@ -196,10 +194,12 @@ class ModelConfig(BaseModel, extra="forbid", validate_assignment=True):
 
 
 class Config(BaseSettings, extra="forbid", validate_assignment=True):
+    model_config = {"arbitrary_types_allowed": True}
     model: ModelConfig
     run: RunConfig | None = None
     datasets: DatasetsConfig | None = None
     generate: GenerateConfig | None = None
+
 
     def pretty_print(self):
         print(self.model_dump_json(indent=4))

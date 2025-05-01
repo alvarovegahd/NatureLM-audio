@@ -28,7 +28,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteriaLi
 
 from NatureLM.checkpoint_utils import save_model_checkpoint
 from NatureLM.config import BeatsConfig, ModelConfig, save_config_as_yaml
-from NatureLM.storage_utils import GSPath
+from NatureLM.storage_handler import StorageHandler
+
 from NatureLM.utils import universal_torch_load
 
 from .beats.BEATs import BEATs, BEATsConfig
@@ -37,58 +38,92 @@ from .utils import StoppingCriteriaSub
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
+import typing
+from pydantic import ValidationError              # ← add at top of file
 
 class NatureLM(nn.Module, PyTorchModelHubMixin):
-    def __init__(
-        self,
-        *,
-        llama_path: Path,
-        beats_path: Path | GSPath | None = None,
-        beats_cfg: BeatsConfig,
-        freeze_beats: bool = True,
-        use_audio_Qformer: bool = True,
-        max_pooling: bool = False,
-        num_audio_query_token: int = 1,
-        freeze_audio_QFormer: bool = False,
-        window_level_Qformer: bool = True,
-        second_per_window: float = 0.333333,
-        second_stride: float = 0.333333,
-        downsample_factor: int = 4,
-        audio_llama_proj_model: Path | GSPath | None = None,
-        freeze_audio_llama_proj: bool = False,
-        lora: bool = True,
-        lora_rank: int = 8,
-        lora_alpha: int = 32,
-        lora_dropout: float = 0.1,
-        flash_attn: Literal["eager", "flash_attention_2"] = "eager",
-        prompt_template: str = "",
-        max_txt_len: int = 128,
-        end_sym: str = "</s>",
-        device: str = "cuda",
-    ):
+    # ------------------------------------------------------------------ #
+    #  Constructor
+    # ------------------------------------------------------------------ #
+    def __init__(self, *, config: typing.Any = None, **unused):
+        """
+        Parameters
+        ----------
+        config : ModelConfig | dict
+            • ModelConfig – preferred (e.g. NatureLM.from_config(...))  
+            • dict        – what 🤗 Hub passes in .from_pretrained().
+        **unused
+            Accept arbitrary extra kwargs so that HF never explodes if it
+            finds unexpected keys in `config.json`.
+        """
+        # -------- 1. Normalise and validate the config -----------------
+        if isinstance(config, ModelConfig):
+            self.cfg = config
+        elif isinstance(config, dict):
+            try:
+                self.cfg = ModelConfig.model_validate(config)
+            except ValidationError as e:
+                raise ValueError(
+                    "Invalid hub-supplied config.  Either upload a proper "
+                    "`ModelConfig` (push the YAML as config.json) or load "
+                    "with NatureLM.from_config()."
+                ) from e
+        else:
+            raise TypeError("`config` must be a ModelConfig instance or dict")
+
         super().__init__()
 
-        self.beats_path = beats_path
-        self.beats_cfg = beats_cfg
-        self.use_audio_Qformer = use_audio_Qformer
-        self.max_pooling = max_pooling
-        self.window_level_Qformer = window_level_Qformer
-        self.second_per_window = second_per_window
-        self.second_stride = second_stride
-        self.downsample_factor = downsample_factor
-        self.lora = lora
-        self.max_txt_len = max_txt_len
-        self.end_sym = end_sym
-        self.prompt_template = prompt_template
-        self.flash_attn = flash_attn
+        # -------- 2. Resolve all paths *once* ---------------------------
+        handler          = StorageHandler(backend=self.cfg.storage)
+        llama_path_obj       = handler.resolve(self.cfg.llama_path)
+        if isinstance(llama_path_obj, Path) and not llama_path_obj.exists():
+            llama_path = self.cfg.llama_path          # treat as HF repo id
+        else:
+            llama_path = llama_path_obj
+        beats_path       = handler.resolve(self.cfg.beats_path) if self.cfg.beats_path else None
+        proj_ckpt_path   = handler.resolve(self.cfg.audio_llama_proj_model) \
+                           if self.cfg.audio_llama_proj_model else None
+        ckpt_path        = handler.resolve(self.cfg.ckpt) if self.cfg.ckpt else None
 
-        logging.info(f"Llama path: {llama_path}")
-        logging.info("Loading Llama Tokenizer")
+        # -------- 3. Keep handy flags / hyper-params -------------------
+        self.use_audio_Qformer   = self.cfg.use_audio_Qformer
+        self.max_pooling         = self.cfg.max_pooling
+        self.window_level_Qformer= self.cfg.window_level_Qformer
+        self.second_per_window   = self.cfg.second_per_window
+        self.second_stride       = self.cfg.second_stride
+        self.downsample_factor   = self.cfg.downsample_factor
+        self.prompt_template     = self.cfg.prompt_template
+        self.max_txt_len         = self.cfg.max_txt_len
+        self.end_sym             = self.cfg.end_sym
+        self.lora                = self.cfg.lora
+        self.flash_attn          = self.cfg.flash_attn
+
+                # -------- 3b.  Convenience local vars --------------------------------
+        device                  = self.cfg.device
+        flash_attn              = self.cfg.flash_attn
+        freeze_beats            = self.cfg.freeze_beats
+        freeze_audio_QFormer    = self.cfg.freeze_audio_QFormer
+        freeze_audio_llama_proj = self.cfg.freeze_audio_llama_proj
+        num_audio_query_token   = self.cfg.num_audio_query_token
+        lora_rank               = self.cfg.lora_rank
+        lora_alpha              = self.cfg.lora_alpha
+        lora_dropout            = self.cfg.lora_dropout
+        audio_llama_proj_model  = proj_ckpt_path          # just for readability
+
+        # keep explicit copies used later in the class -------------------------
+        self.beats_cfg   = self.cfg.beats_cfg
+        self.beats_path  = beats_path
+        self.htsat       = getattr(self.cfg, "htsat", False)   # optional flags that
+        self.aves        = getattr(self.cfg, "aves", False)    # show up in hidden-size
+        self.aves_large  = getattr(self.cfg, "aves_large", False)
+
+
+        # -------- 4. Load tokenizer ------------------------
+        logging.info("Loading LLaMA tokenizer")
         self.llama_tokenizer = AutoTokenizer.from_pretrained(llama_path, use_fast=False)
         self.llama_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         self.llama_tokenizer.padding_side = "right"
 
-        logging.info("Loading Llama Model")
         if device == "cpu":
             self.llama_model = AutoModelForCausalLM.from_pretrained(
                 llama_path,
@@ -206,40 +241,13 @@ class NatureLM(nn.Module, PyTorchModelHubMixin):
         self.config: ModelConfig = None  # set this in from_config
 
     @classmethod
-    def from_config(cls, config: ModelConfig):
-        model = cls(
-            llama_path=config.llama_path,
-            beats_path=config.beats_path,
-            freeze_beats=config.freeze_beats,
-            use_audio_Qformer=config.use_audio_Qformer,
-            max_pooling=config.max_pooling,
-            num_audio_query_token=config.num_audio_query_token,
-            freeze_audio_QFormer=config.freeze_audio_QFormer,
-            window_level_Qformer=config.window_level_Qformer,
-            second_per_window=config.second_per_window,
-            second_stride=config.second_stride,
-            downsample_factor=config.downsample_factor,
-            audio_llama_proj_model=config.audio_llama_proj_model,
-            freeze_audio_llama_proj=config.freeze_audio_llama_proj,
-            lora=config.lora,
-            lora_rank=config.lora_rank,
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
-            prompt_template=config.prompt_template,
-            max_txt_len=config.max_txt_len,
-            end_sym=config.end_sym,
-            flash_attn=config.flash_attn,
-            device=config.device,
-        )
-        model.config = config
-        ckpt_path = config.ckpt
-        if ckpt_path:
-            logging.info(f"⏳ Load NatureLM ckpt from: {ckpt_path}")
-            ckpt = universal_torch_load(ckpt_path, cache_mode="use", map_location="cpu")
+    def from_config(cls, cfg: ModelConfig):
+        model = cls(config=cfg)              #  <-- single argument now
+        if cfg.ckpt:
+            ckpt = universal_torch_load(cfg.ckpt, cache_mode="use", map_location="cpu")
             model.load_state_dict(ckpt["model"], strict=False)
-            logging.info("✅ Finished loading from ckpt")
-
         return model
+
 
     def _save_to_local(
         self, output_dir: Union[str, os.PathLike], use_distributed: bool = False, drop_untrained_params: bool = False
